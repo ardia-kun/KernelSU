@@ -4,28 +4,24 @@
 #include "linux/err.h"
 #include "linux/init.h"
 #include "linux/init_task.h"
-#include "linux/kallsyms.h"
 #include "linux/kernel.h"
 #include "linux/kprobes.h"
-#include "linux/list.h"
 #include "linux/lsm_hooks.h"
-#include "linux/mm.h"
-#include "linux/mm_types.h"
+#include "linux/module.h"
 #include "linux/nsproxy.h"
 #include "linux/path.h"
 #include "linux/printk.h"
-#include "linux/sched.h"
-#include "linux/security.h"
-#include "linux/stddef.h"
-#include "linux/types.h"
 #include "linux/uaccess.h"
 #include "linux/uidgid.h"
 #include "linux/version.h"
 #include "linux/mount.h"
 
+#include "linux/proc_fs.h"
 #include "linux/fs.h"
 #include "linux/namei.h"
 #include "linux/rcupdate.h"
+#include "linux/seq_file.h"
+#include "../../fs/mount.h"
 
 #include "allowlist.h"
 #include "arch.h"
@@ -33,15 +29,60 @@
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 #include "ksud.h"
-#include "linux/vmalloc.h"
 #include "manager.h"
 #include "selinux/selinux.h"
 #include "uid_observer.h"
 #include "kernel_compat.h"
 
-static bool ksu_module_mounted = false;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+extern inline bool may_mount(void);
+extern inline int check_mnt(struct mount *mnt);
+extern void mntput_no_expire(struct mount *mnt);
+extern int do_umount(struct mount *mnt, int flags);
+static inline bool ksu_path_mounted(const struct path *path)
+	{
+		return path->mnt->mnt_root == path->dentry;
+	}
+	static int ksu_can_umount(const struct path *path, int flags)
+	{
+		struct mount *mnt = real_mount(path->mnt);
+
+		if (!may_mount())
+			return -EPERM;
+		if (!ksu_path_mounted(path))
+			return -EINVAL;
+		if (!check_mnt(mnt))
+			return -EINVAL;
+		if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
+			return -EINVAL;
+		if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return 0;
+	}
+	int ksu_path_umount(struct path *path, int flags)
+{
+	struct mount *mnt = real_mount(path->mnt);
+	int ret;
+
+	ret = ksu_can_umount(path, flags);
+	if (!ret)
+		ret = do_umount(mnt, flags);
+
+	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
+	dput(path->dentry);
+	mntput_no_expire(mnt);
+	return ret;
+}
+#else
+	//not tested
+#endif
 
 extern int handle_sepolicy(unsigned long arg3, void __user *arg4);
+int vmin_ksu = KERNEL_SU_VERSION;
+int __read_mostly ksu_version = 0;
+module_param(ksu_version, int, 0644);
 
 static inline bool is_allow_su()
 {
@@ -137,8 +178,7 @@ void escape_to_root(void)
 	// setup capabilities
 	// we need CAP_DAC_READ_SEARCH becuase `/data/adb/ksud` is not accessible for non root process
 	// we add it here but don't add it to cap_inhertiable, it would be dropped automaticly after exec!
-	u64 cap_for_ksud =
-		profile->capabilities.effective | CAP_DAC_READ_SEARCH;
+	u64 cap_for_ksud = profile->capabilities.effective | CAP_DAC_READ_SEARCH;
 	memcpy(&cred->cap_effective, &cap_for_ksud,
 	       sizeof(cred->cap_effective));
 	memcpy(&cred->cap_inheritable, &profile->capabilities.effective,
@@ -229,9 +269,7 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
-#ifdef CONFIG_KSU_DEBUG
-	pr_info("option: 0x%x, cmd: %ld\n", option, arg2);
-#endif
+	// pr_info("option: 0x%x, cmd: %ld\n", option, arg2);
 
 	if (arg2 == CMD_BECOME_MANAGER) {
 		// quick check
@@ -242,10 +280,8 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 			return 0;
 		}
 		if (ksu_is_manager_uid_valid()) {
-#ifdef CONFIG_KSU_DEBUG
 			pr_info("manager already exist: %d\n",
 				ksu_get_manager_uid());
-#endif
 			return 0;
 		}
 
@@ -257,7 +293,7 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 #ifdef CONFIG_KSU_DEBUG
 			pr_err("become_manager: copy param err\n");
 #endif
-			goto block;
+			return 0;
 		}
 
 		// for user 0, it is /data/data
@@ -275,7 +311,7 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 
 		if (startswith(param, (char *)prefix) != 0) {
 			pr_info("become_manager: invalid param: %s\n", param);
-			goto block;
+			return 0;
 		}
 
 		// stat the param, app must have permission to do this
@@ -283,13 +319,12 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		struct path path;
 		if (kern_path(param, LOOKUP_DIRECTORY, &path)) {
 			pr_err("become_manager: kern_path err\n");
-			goto block;
+			return 0;
 		}
-		uid_t inode_uid = path.dentry->d_inode->i_uid.val;
-		path_put(&path);
-		if (inode_uid != current_uid().val) {
+		if (path.dentry->d_inode->i_uid.val != current_uid().val) {
 			pr_err("become_manager: path uid != current uid\n");
-			goto block;
+			path_put(&path);
+			return 0;
 		}
 		char *pkg = param + strlen(prefix);
 		pr_info("become_manager: param pkg: %s\n", pkg);
@@ -299,10 +334,8 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
 				pr_err("become_manager: prctl reply error\n");
 			}
-			return 0;
 		}
-	block:
-		last_failed_uid = current_uid().val;
+		path_put(&path);
 		return 0;
 	}
 
@@ -320,7 +353,9 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 	// Both root manager and root processes should be allowed to get version
 	if (arg2 == CMD_GET_VERSION) {
 		if (is_manager() || 0 == current_uid().val) {
-			u32 version = KERNEL_SU_VERSION;
+			if (ksu_version < vmin_ksu)
+				ksu_version = vmin_ksu;
+			u32 version = (u32) ksu_version;
 			if (copy_to_user(arg3, &version, sizeof(version))) {
 				pr_err("prctl reply error, cmd: %lu\n", arg2);
 			}
@@ -348,11 +383,6 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 				boot_complete_lock = true;
 				pr_info("boot_complete triggered\n");
 			}
-			break;
-		}
-		case EVENT_MODULE_MOUNTED: {
-			ksu_module_mounted = true;
-			pr_info("module mounted!\n");
 			break;
 		}
 		default:
@@ -518,8 +548,13 @@ static void ksu_umount_mnt(struct path *path, int flags)
 	if (err) {
 		pr_info("umount %s failed: %d\n", path->dentry->d_iname, err);
 	}
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+	int err = ksu_path_umount(path, flags);
+	if (err) {
+		pr_info("umount %s failed: %d\n", path->dentry->d_iname, err);
+	}
 #else
-	// TODO: umount for non GKI kernel
+	//not tested
 #endif
 }
 
@@ -546,11 +581,6 @@ static void try_umount(const char *mnt, bool check_mnt, int flags)
 
 int ksu_handle_setuid(struct cred *new, const struct cred *old)
 {
-	// this hook is used for umounting overlayfs for some uid, if there isn't any module mounted, just ignore it!
-	if (!ksu_module_mounted) {
-		return 0;
-	}
-
 	if (!new || !old) {
 		return 0;
 	}
@@ -586,13 +616,11 @@ int ksu_handle_setuid(struct cred *new, const struct cred *old)
 	// when we umount for such process, that is a disaster!
 	bool is_zygote_child = is_zygote(old->security);
 	if (!is_zygote_child) {
-		pr_info("handle umount ignore non zygote child: %d\n",
-			current->pid);
+		pr_info("handle umount ignore non zygote child: %d\n", current->pid);
 		return 0;
 	}
 	// umount the target mnt
-	pr_info("handle umount for uid: %d, pid: %d\n", new_uid.val,
-		current->pid);
+	pr_info("handle umount for uid: %d, pid: %d\n", new_uid.val, current->pid);
 
 	// fixme: use `collect_mounts` and `iterate_mount` to iterate all mountpoint and
 	// filter the mountpoint whose target is `/data/adb`
@@ -735,181 +763,14 @@ void __init ksu_lsm_hook_init(void)
 #endif
 }
 
-#ifdef MODULE
-static int override_security_head(void *head, const void *new_head, size_t len)
-{
-	unsigned long base = (unsigned long)head & PAGE_MASK;
-	unsigned long offset = offset_in_page(head);
-
-	// this is impossible for our case because the page alignment
-	// but be careful for other cases!
-	BUG_ON(offset + len > PAGE_SIZE);
-	struct page *page = phys_to_page(__pa(base));
-	if (!page) {
-		return -EFAULT;
-	}
-
-	void *addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
-	if (!addr) {
-		return -ENOMEM;
-	}
-	memcpy(addr + offset, new_head, len);
-	vunmap(addr);
-	return 0;
-}
-
-static void free_security_hook_list(struct hlist_head *head)
-{
-	struct hlist_node *temp;
-	struct security_hook_list *entry;
-
-	if (!head)
-		return;
-
-	hlist_for_each_entry_safe (entry, temp, head, list) {
-		hlist_del(&entry->list);
-		kfree(entry);
-	}
-
-	kfree(head);
-}
-
-struct hlist_head *copy_security_hlist(struct hlist_head *orig)
-{
-	struct hlist_head *new_head = kmalloc(sizeof(*new_head), GFP_KERNEL);
-	if (!new_head)
-		return NULL;
-
-	INIT_HLIST_HEAD(new_head);
-
-	struct security_hook_list *entry;
-	struct security_hook_list *new_entry;
-
-	hlist_for_each_entry (entry, orig, list) {
-		new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
-		if (!new_entry) {
-			free_security_hook_list(new_head);
-			return NULL;
-		}
-
-		*new_entry = *entry;
-
-		hlist_add_tail_rcu(&new_entry->list, new_head);
-	}
-
-	return new_head;
-}
-
-#define LSM_SEARCH_MAX 180 // This should be enough to iterate
-static void *find_head_addr(void *security_ptr, int *index)
-{
-	if (!security_ptr) {
-		return NULL;
-	}
-	struct hlist_head *head_start =
-		(struct hlist_head *)&security_hook_heads;
-
-	for (int i = 0; i < LSM_SEARCH_MAX; i++) {
-		struct hlist_head *head = head_start + i;
-		struct security_hook_list *pos;
-		hlist_for_each_entry (pos, head, list) {
-			if (pos->hook.capget == security_ptr) {
-				if (index) {
-					*index = i;
-				}
-				return head;
-			}
-		}
-	}
-
-	return NULL;
-}
-
-#define GET_SYMBOL_ADDR(sym)                                                   \
-	({                                                                     \
-		void *addr = kallsyms_lookup_name(#sym ".cfi_jt");             \
-		if (!addr) {                                                   \
-			addr = kallsyms_lookup_name(#sym);                     \
-		}                                                              \
-		addr;                                                          \
-	})
-
-#define KSU_LSM_HOOK_HACK_INIT(head_ptr, name, func)                           \
-	do {                                                                   \
-		static struct security_hook_list hook = {                      \
-			.hook = { .name = func }                               \
-		};                                                             \
-		hook.head = head_ptr;                                          \
-		hook.lsm = "ksu";                                              \
-		struct hlist_head *new_head = copy_security_hlist(hook.head);  \
-		if (!new_head) {                                               \
-			pr_err("Failed to copy security list: %s\n", #name);   \
-			break;                                                 \
-		}                                                              \
-		hlist_add_tail_rcu(&hook.list, new_head);                      \
-		if (override_security_head(hook.head, new_head,                \
-					   sizeof(*new_head))) {               \
-			free_security_hook_list(new_head);                     \
-			pr_err("Failed to hack lsm for: %s\n", #name);         \
-		}                                                              \
-	} while (0)
-
-void __init ksu_lsm_hook_init_hack(void)
-{
-	void *cap_prctl = GET_SYMBOL_ADDR(cap_task_prctl);
-	void *prctl_head = find_head_addr(cap_prctl, NULL);
-	if (prctl_head) {
-		if (prctl_head != &security_hook_heads.task_prctl) {
-			pr_warn("prctl's address has shifted!\n");
-		}
-		KSU_LSM_HOOK_HACK_INIT(prctl_head, task_prctl, ksu_task_prctl);
-	} else {
-		pr_warn("Failed to find task_prctl!\n");
-	}
-
-	int inode_killpriv_index = -1;
-	void *cap_killpriv = GET_SYMBOL_ADDR(cap_inode_killpriv);
-	find_head_addr(cap_killpriv, &inode_killpriv_index);
-	if (inode_killpriv_index < 0) {
-		pr_warn("Failed to find inode_rename, use kprobe instead!\n");
-		register_kprobe(&renameat_kp);
-	} else {
-		int inode_rename_index = inode_killpriv_index +
-					 &security_hook_heads.inode_rename -
-					 &security_hook_heads.inode_killpriv;
-		struct hlist_head *head_start =
-			(struct hlist_head *)&security_hook_heads;
-		void *inode_rename_head = head_start + inode_rename_index;
-		if (inode_rename_head != &security_hook_heads.inode_rename) {
-			pr_warn("inode_rename's address has shifted!\n");
-		}
-		KSU_LSM_HOOK_HACK_INIT(inode_rename_head, inode_rename,
-				       ksu_inode_rename);
-	}
-	void *cap_setuid = GET_SYMBOL_ADDR(cap_task_fix_setuid);
-	void *setuid_head = find_head_addr(cap_setuid, NULL);
-	if (setuid_head) {
-		if (setuid_head != &security_hook_heads.task_fix_setuid) {
-			pr_warn("setuid's address has shifted!\n");
-		}
-		KSU_LSM_HOOK_HACK_INIT(setuid_head, task_fix_setuid,
-				       ksu_task_fix_setuid);
-	} else {
-		pr_warn("Failed to find task_fix_setuid!\n");
-	}
-	smp_mb();
-}
-#endif
-
 void __init ksu_core_init(void)
 {
 #ifndef MODULE
 	pr_info("ksu_lsm_hook_init\n");
 	ksu_lsm_hook_init();
-
 #else
-	pr_info("ksu_lsm_hook_init hack!!!!\n");
-	ksu_lsm_hook_init_hack();
+	pr_info("ksu_kprobe_init\n");
+	ksu_kprobe_init();
 #endif
 }
 
