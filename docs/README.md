@@ -6,11 +6,10 @@
 
 A Kernel-based root solution for Android devices.
 
-[![Latest release](https://img.shields.io/github/v/release/tiann/KernelSU?label=Release&logo=github)](https://github.com/tiann/KernelSU/releases/latest)
-[![Weblate](https://img.shields.io/badge/Localization-Weblate-teal?logo=weblate)](https://hosted.weblate.org/engage/kernelsu)
-[![Channel](https://img.shields.io/badge/Follow-Telegram-blue.svg?logo=telegram)](https://t.me/KernelSU)
+[![Latest release](https://img.shields.io/github/v/release/Rve27/KernelSU?label=Release&logo=github)](https://github.com/Rve27/KernelSU/releases/latest)
+[![Channel](https://img.shields.io/badge/Follow-Telegram-blue.svg?logo=telegram)](https://t.me/rveupdate)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-orange.svg?logo=gnu)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
-[![GitHub License](https://img.shields.io/github/license/tiann/KernelSU?logo=gnu)](/LICENSE)
+[![GitHub License](https://img.shields.io/github/license/Rve27/KernelSU?logo=gnu)](/LICENSE)
 
 ## Features
 
@@ -18,27 +17,13 @@ A Kernel-based root solution for Android devices.
 2. Module system based on [OverlayFS](https://en.wikipedia.org/wiki/OverlayFS).
 3. [App Profile](https://kernelsu.org/guide/app-profile.html): Lock up the root power in a cage.
 
-## Compatibility State
-
-KernelSU officially supports Android GKI 2.0 devices (kernel 5.10+). Older kernels (4.14+) are also compatible, but the kernel will have to be built manually.
-
-With this, WSA, ChromeOS, and container-based Android are all supported.
-
-Currently, only `arm64-v8a` and `x86_64` are supported.
-
-## Usage
-
-- [Installation Instruction](https://kernelsu.org/guide/installation.html)
-- [How to build?](https://kernelsu.org/guide/how-to-build.html)
-- [Official Website](https://kernelsu.org/)
-
 ## Translation
 
 To help translate KernelSU or improve existing translations, please use [Weblate](https://hosted.weblate.org/engage/kernelsu/). PR of Manager's translation is no longer accepted, because it will conflict with Weblate.
 
 ## Discussion
 
-- Telegram: [@KernelSU](https://t.me/KernelSU)
+- Telegram: [RvOS Groups](https://t.me/rvegroup)
 
 ## Security
 
