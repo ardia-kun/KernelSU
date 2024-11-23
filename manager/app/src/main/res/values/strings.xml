@@ -134,8 +134,8 @@
     <string name="save_log">Save logs</string>
     <string name="log_saved">Logs saved</string>
 
-    <!-- Unofficial by Rve -->
-    <string name="unofficial_build">Unofficial build by Rve</string>
-    <string name="unofficial_build_by_rve">https://github.com/Rve27/KernelSU</string>
+    <!-- Codec By Rve27 -->
+    <string name="unofficial_build">Unofficial Support For FOG by Kidz</string>
+    <string name="unofficial_build_by_rve">https://github.com/ardia-kun/KernelSU</string>
     <string name="unofficial_build_description">KernelSU Official no longer supports non-GKI kernels since v1.0.0</string>
 </resources>
